@@ -19,10 +19,14 @@ http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
   if (url.pathname.startsWith('/api/')) {
-    const key = loadKey();
+    const key = String(req.headers['x-bus-key'] || '').trim() || loadKey();   // 사용자 키 우선, 없으면 config.json
     if (!key) {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       return res.end(JSON.stringify({ error: 'NO_KEY' }));
+    }
+    if (!/^[A-Za-z0-9%+/=_-]{10,200}$/.test(key)) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ error: 'BAD_KEY' }));
     }
     const enc = key.includes('%') ? key : encodeURIComponent(key);
     const target = BASE + url.pathname.slice(5) + '?serviceKey=' + enc +

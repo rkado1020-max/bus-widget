@@ -47,8 +47,18 @@
   <button class="arrow" id="swap" title="출발/도착 바꾸기">⇄</button>
   <button class="stop" id="toBtn"></button>
 </div>
-<div class="bar"><span id="upd"></span><button id="reload" title="새로고침">⟳</button></div>
+<div class="bar"><span id="upd"></span><span><button id="keyBtn" title="인증키 변경">🔑</button><button id="reload" title="새로고침">⟳</button></span></div>
 <div id="main"></div>
+
+<dialog id="keyDlg">
+  <b>공공데이터포털 인증키</b>
+  <p style="margin:8px 0;color:var(--sub);font-size:12px">경기도 버스 정보를 보려면 본인의 인증키가 필요해요. 키는 이 기기의 브라우저에만 저장돼요.</p>
+  <input id="keyIn" placeholder="일반 인증키 (Decoding 또는 Encoding)" autocomplete="off" spellcheck="false">
+  <p id="keyMsg" style="margin:8px 0;color:var(--soon);font-size:12px;min-height:16px"></p>
+  <button class="more" id="keySave" style="margin:0">확인하고 시작하기</button>
+  <p style="margin:10px 0 0;font-size:11px;color:var(--sub)">키 받는 방법: <a href="https://www.data.go.kr" target="_blank" rel="noopener">data.go.kr</a>에서 로그인 후 아래 세 가지를 활용신청하세요.<br>· 경기도_정류소 조회<br>· 경기도_버스노선 조회<br>· 경기도_버스도착정보 조회<br>마이페이지의 일반 인증키를 복사해 붙여 넣으면 돼요.</p>
+  <button class="close" id="keyCancel" style="float:none;display:none;margin-top:8px" onclick="keyDlg.close()">닫기</button>
+</dialog>
 
 <dialog id="dlg">
   <button class="close" onclick="dlg.close()">✕</button>
@@ -82,10 +92,23 @@ function arr(json, ...names) {
   const first = Object.values(body).find(v => v && typeof v === 'object');
   return first ? [].concat(first) : [];
 }
+let apiKey = load('apikey', '');   // 사용자가 직접 넣은 인증키 (이 브라우저에만 저장돼요)
+const ERR = {
+  SERVICE_KEY_IS_NOT_REGISTERED_ERROR: '등록되지 않은 인증키예요. 방금 발급받았다면 잠시 뒤에 다시 해 보세요. 세 서비스(정류소·노선·도착정보)가 모두 활용신청되어 있는지도 확인해 주세요.',
+  SERVICE_ACCESS_DENIED_ERROR: '이 서비스를 쓸 권한이 없어요. 활용신청이 승인됐는지 확인해 주세요.',
+  LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR: '오늘 호출 한도를 다 썼어요. 내일 다시 쓰거나 운영계정으로 전환해 주세요.',
+  APPLICATION_ERROR: '공공데이터 서버에 문제가 있어요. 잠시 뒤에 다시 해 보세요.',
+};
+class KeyError extends Error {}
 async function api(p, params) {
-  const r = await fetch('/api/' + p + '?' + new URLSearchParams(params));
+  const r = await fetch('/api/' + p + '?' + new URLSearchParams(params), { headers: { 'x-bus-key': apiKey } });
   const j = await r.json();
-  if (j.error === 'NO_KEY') throw new Error('서버 폴더의 config.json에 인증키를 넣어 주세요.');
+  if (j.error === 'NO_KEY' || j.error === 'BAD_KEY') throw new KeyError('인증키를 입력해 주세요.');
+  const e = j.OpenAPI_ServiceResponse?.cmmMsgHeader;
+  if (e) {
+    const m = ERR[e.errMsg] || e.returnAuthMsg || e.errMsg;
+    throw (e.errMsg === 'SERVICE_KEY_IS_NOT_REGISTERED_ERROR' || e.errMsg === 'SERVICE_ACCESS_DENIED_ERROR') ? new KeyError(m) : new Error(m);
+  }
   return j;
 }
 const msg = t => { $('main').innerHTML = '<div class="msg">' + t + '</div>'; };
@@ -231,7 +254,9 @@ async function refresh(force) {
     results = all.map(o => ({ ...o, total: o.wait == null ? null : o.wait + o.ride }))
       .sort((x, y) => (x.total ?? 1e9) - (y.total ?? 1e9));
     render();
-  } catch (e) { msg(e.message); }
+  } catch (e) {
+    msg(e.message + (e instanceof KeyError ? '<br><br><button class="more" onclick="openKeyDialog(true)">인증키 다시 입력</button>' : ''));
+  }
   busy = false;
 }
 
@@ -321,8 +346,26 @@ $('swap').onclick = () => {   // 출발↔도착 (내 위치 기준이면 지금
 $('reload').onclick = () => { here = null; tapRefresh(); };
 $('main').addEventListener('click', e => { if (!e.target.closest('#moreBtn, #others')) tapRefresh(); });
 
+function openKeyDialog(canClose) {
+  $('keyIn').value = ''; $('keyMsg').textContent = '';
+  $('keyCancel').style.display = canClose ? 'inline' : 'none';
+  if (!$('keyDlg').open) $('keyDlg').showModal();
+  $('keyIn').focus();
+}
+$('keyDlg').addEventListener('cancel', e => { if (!apiKey) e.preventDefault(); });   // 키가 없으면 닫을 수 없어요
+$('keyBtn').onclick = () => openKeyDialog(true);
+$('keySave').onclick = async () => {
+  const k = $('keyIn').value.trim();
+  if (k.length < 10) return ($('keyMsg').textContent = '인증키를 붙여 넣어 주세요.');
+  const old = apiKey; apiKey = k; $('keySave').disabled = true; $('keyMsg').textContent = '확인 중…';
+  try {
+    await api('busstationservice/v2/getBusStationListv2', { keyword: '소사' });   // 키가 맞는지 한 번만 확인해요
+    save('apikey', k); $('keyDlg').close(); restart();
+  } catch (e) { apiKey = old; $('keyMsg').textContent = e.message; }
+  $('keySave').disabled = false;
+};
 drawRoute();
-restart();
+if (!apiKey) openKeyDialog(false); else restart();
 </script>
 </body>
 </html>
