@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>버스 위젯</title>
+<style>
+  :root{--bg:#fff;--fg:#1d2433;--sub:#6b7385;--line:#e6e9f0;--accent:#2f6fed;--soon:#e5484d;--card:#f3f6ff}
+  @media (prefers-color-scheme:dark){:root{--bg:#171a22;--fg:#eceff6;--sub:#9aa3b5;--line:#2a2f3c;--accent:#6d9bff;--soon:#ff6b70;--card:#1f2535}}
+  *{box-sizing:border-box}
+  body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.45 "Malgun Gothic",system-ui,sans-serif}
+  .route{display:flex;align-items:center;gap:6px}
+  .route button.stop{flex:1;min-width:0;text-align:left;border:1px solid var(--line);background:none;color:var(--fg);border-radius:8px;padding:7px 9px;cursor:pointer;font:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .route small{display:block;color:var(--sub);font-size:11px}
+  .arrow{border:none;background:none;color:var(--accent);font-size:22px;cursor:pointer;padding:0 4px}
+  .bar{display:flex;justify-content:space-between;align-items:center;color:var(--sub);font-size:12px;margin:10px 0 6px}
+  .bar button{border:none;background:none;color:var(--sub);cursor:pointer;font-size:15px}
+  .best{background:var(--card);border-radius:12px;padding:12px 14px}
+  .best .tag{font-size:11px;color:var(--accent);font-weight:700}
+  .best .top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 6px}
+  .best .no{font-size:24px;font-weight:800;color:var(--accent)}
+  .best .eta{font-size:20px;font-weight:800;text-align:right}
+  .best .eta.soon{color:var(--soon)}
+  .best .eta small{display:block;font-size:11px;font-weight:400;color:var(--sub)}
+  .best dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:13px}
+  .best dt{color:var(--sub)}
+  .best dd{margin:0}
+  .more{display:block;width:100%;margin-top:10px;padding:9px;border:1px solid var(--line);border-radius:10px;background:none;color:var(--sub);cursor:pointer;font:inherit}
+  .item{display:flex;align-items:center;gap:10px;padding:10px 2px;border-top:1px solid var(--line)}
+  .item .no{min-width:58px;font-weight:700;font-size:16px;color:var(--accent)}
+  .item .info{flex:1;font-size:12px;color:var(--sub)}
+  .item .eta{text-align:right;font-weight:700;font-size:15px}
+  .item .eta small{display:block;font-weight:400;font-size:11px;color:var(--sub)}
+  #others{display:none}
+  .msg{padding:18px 4px;color:var(--sub);text-align:center}
+  dialog{border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--fg);width:min(340px,92vw);padding:14px}
+  dialog input{width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;background:none;color:var(--fg);font:inherit}
+  dialog li{list-style:none;padding:8px 4px;border-bottom:1px solid var(--line);cursor:pointer}
+  dialog ul{margin:8px 0;padding:0;max-height:240px;overflow:auto}
+  dialog li small{color:var(--sub)}
+  .close{float:right;border:none;background:none;color:var(--sub);cursor:pointer;font-size:16px}
+</style>
+</head>
+<body>
+<div class="route">
+  <button class="stop" id="fromBtn"></button>
+  <button class="arrow" id="swap" title="출발/도착 바꾸기">⇄</button>
+  <button class="stop" id="toBtn"></button>
+</div>
+<div class="bar"><span id="upd"></span><button id="reload" title="새로고침">⟳</button></div>
+<div id="main"></div>
+
+<dialog id="dlg">
+  <button class="close" onclick="dlg.close()">✕</button>
+  <b id="dlgTitle"></b>
+  <p style="margin:8px 0"><input id="q" placeholder="정류장 이름 (예: 소새울역, 하이텍)" autocomplete="off"></p>
+  <ul id="res"></ul>
+</dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+const MIN_PER_STOP = 2;   // 정거장당 평균 소요시간(분) 추정값 — 구간 시간 API가 없어요
+const WALK_M_PER_MIN = 65; // 도보 속도
+const MAX_CANDIDATES = 6;  // 후보로 살펴볼 주변 정류장 수
+const hhmm = d => d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+// from === null 이면 현재 위치 기준 자동 선택, 값이 있으면 직접 고른 정류장
+let from = load('from', null);
+let to   = load('to', { id: '212000032', name: '약대오거리' });   // 기본 도착지: DB하이텍 근처, 71번이 서는 정류장
+let here = null;            // 현재 위치 {lat, lng}
+let origin = null;          // 현재 출발 정류장 {id, name, distance}
+let timer, results = [];
+const routeStops = new Map();  // routeId → 정류장 목록(캐시)
+
+function arr(json, ...names) {
+  const body = json?.response?.msgBody ?? {};
+  for (const n of names) if (body[n]) return [].concat(body[n]);
+  const first = Object.values(body).find(v => v && typeof v === 'object');
+  return first ? [].concat(first) : [];
+}
+async function api(p, params) {
+  const r = await fetch('/api/' + p + '?' + new URLSearchParams(params));
+  const j = await r.json();
+  if (j.error === 'NO_KEY') throw new Error('서버 폴더의 config.json에 인증키를 넣어 주세요.');
+  return j;
+}
+const msg = t => { $('main').innerHTML = '<div class="msg">' + t + '</div>'; };
+
+function drawRoute() {
+  const f = origin ? origin.name + (origin.distance != null ? ` · ${origin.distance}m` : '') : '위치 확인 중…';
+  $('fromBtn').innerHTML = `<small>출발 ${from ? '(직접 선택)' : '📍 내 위치 기준'}</small>` + f;
+  $('toBtn').innerHTML = '<small>도착</small>' + to.name;
+}
+
+function locate() {
+  return new Promise((ok, fail) => {
+    if (!navigator.geolocation) return fail(new Error('이 기기는 위치 정보를 지원하지 않아요.'));
+    navigator.geolocation.getCurrentPosition(
+      p => ok({ lat: p.coords.latitude, lng: p.coords.longitude }),
+      e => fail(new Error(e.code === 1 ? '위치 권한이 꺼져 있어요. 브라우저에서 위치를 허용해 주세요.' : '현재 위치를 가져오지 못했어요.')),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 20000 });
+  });
+}
+
+async function stationsOf(routeId) {
+  if (!routeStops.has(routeId))
+    routeStops.set(routeId, arr(await api('busrouteservice/v2/getBusRouteStationListv2', { routeId }), 'busRouteStationList'));
+  return routeStops.get(routeId);
+}
+
+// 한 정류장에서 도착지로 가는 노선별 정보
+// 도착지 정류장의 도착예정(몇 분 뒤 ÷ 몇 정거장 전)으로 지금 이 노선의 정거장당 소요시간을 역산해요
+let destArr = new Map();
+async function perStopMin(routeId, stationId) {
+  if (!destArr.has(stationId))
+    destArr.set(stationId, arr(await api('busarrivalservice/v2/getBusArrivalListv2', { stationId }), 'busArrivalList').filter(x => x.routeId));
+  const ar = destArr.get(stationId).find(x => String(x.routeId) === String(routeId));
+  if (!ar) return null;
+  const v = [[ar.predictTime1, ar.locationNo1], [ar.predictTime2, ar.locationNo2]]
+    .map(([t, n]) => [Number(t), Number(n)]).filter(([t, n]) => t > 0 && n >= 3)   // 너무 가까운 버스는 오차가 커서 제외
+    .map(([t, n]) => t / n);
+  return v.length ? Math.min(4, Math.max(1, v.reduce((a, b) => a + b) / v.length)) : null;
+}
+
+async function optionsAt(stop) {
+  const via = arr(await api('busstationservice/v2/getBusStationViaRouteListv2', { stationId: stop.id }), 'busRouteList');
+  const key = to.name.replace(/\(.*\)/, '');
+  const out = [];
+  // 전광판과 같은 도착예정 정보(경기도 버스도착정보 API)
+  let arrivals = [];
+  try { arrivals = arr(await api('busarrivalservice/v2/getBusArrivalListv2', { stationId: stop.id }), 'busArrivalList').filter(x => x.routeId); } catch {}
+  await Promise.all(via.map(async r => {
+    const st = await stationsOf(String(r.routeId));
+    const a = st.find(s => String(s.stationId) === String(stop.id));
+    const hit = a && st.find(s => Number(s.stationSeq) > Number(a.stationSeq) &&
+      (String(s.stationId) === String(to.id) || (s.stationName || '').includes(key)));
+    if (!hit) return;
+    const buses = arr(await api('buslocationservice/v2/getBusLocationListv2', { routeId: String(r.routeId) }), 'busLocationList')
+      .map(b => Number(a.stationSeq) - Number(b.stationSeq)).filter(n => n >= 0).sort((x, y) => x - y);
+    const walk = Math.ceil((stop.distance || 0) / WALK_M_PER_MIN);
+    // 걸어가서 탈 수 있는 첫 버스(도착까지 걸리는 시간 ≥ 도보 시간)
+    let away = buses.find(n => n * MIN_PER_STOP >= walk);
+    const stops = Number(hit.stationSeq) - Number(a.stationSeq);
+    let wait = away == null ? null : away * MIN_PER_STOP, live = false, next = buses.filter(n => n > (away ?? -1))[0] ?? null;
+    const ar = arrivals.find(x => String(x.routeId) === String(r.routeId));
+    if (ar) {   // 전광판 값이 있으면 우선 사용 (도보로 못 타는 버스는 다음 버스)
+      const c = [[ar.predictTime1, ar.locationNo1], [ar.predictTime2, ar.locationNo2]]
+        .filter(([t]) => t !== '' && t != null && Number(t) >= walk);
+      if (c.length) { wait = Number(c[0][0]); away = c[0][1] === '' ? null : Number(c[0][1]); live = true; }
+    }
+    let per = null;
+    try { per = await perStopMin(r.routeId, String(hit.stationId)); } catch {}
+    out.push({ routeName: r.routeName, stop, walk, stops, ride: Math.round(stops * (per ?? MIN_PER_STOP)), rideLive: per != null, away, wait, next, live });
+  }));
+  return out;
+}
+
+async function refresh() {
+  try {
+    let cands;
+    if (from) {
+      origin = { ...from, distance: null };
+      // 맞은편·가까운 정류장(이름이 달라도)도 함께 살펴봐요: 직접 고른 정류장 반경 250m
+      const found = arr(await api('busstationservice/v2/getBusStationListv2', { keyword: from.name }), 'busStationList');
+      const me = found.find(x => String(x.stationId) === String(from.id));
+      const same = me ? arr(await api('busstationservice/v2/getBusStationAroundListv2', { x: me.x, y: me.y }), 'busStationAroundList')
+        .filter(x => x.distance <= 250).slice(0, MAX_CANDIDATES + 2)
+        .map(x => ({ id: String(x.stationId), name: x.stationName, distance: x.distance })) : [];
+      cands = same.length ? same : [origin];
+    } else {
+      if (!here) here = await locate();
+      const near = arr(await api('busstationservice/v2/getBusStationAroundListv2', { x: here.lng, y: here.lat }), 'busStationAroundList')
+        .sort((a, b) => a.distance - b.distance).slice(0, MAX_CANDIDATES)
+        .map(s => ({ id: String(s.stationId), name: s.stationName, distance: s.distance }));
+      if (!near.length) return msg('주변에 정류장이 없어요.');
+      origin = near[0]; cands = near;
+    }
+    drawRoute();
+    destArr = new Map();
+    let all = (await Promise.all(cands.map(optionsAt))).flat();
+    const minStops = Math.min(...all.map(o => o.stops));
+    all = all.filter(o => o.stops <= minStops * 2);   // 크게 돌아가는 노선은 제외
+    results = all.map(o => ({ ...o, total: o.wait == null ? null : o.wait + o.ride }))
+      .sort((x, y) => (x.total ?? 1e9) - (y.total ?? 1e9));
+    render();
+  } catch (e) { msg(e.message); }
+}
+
+function render() {
+  if (!results.length) return msg('근처 정류장에서 도착지로 바로 가는 버스가 없어요.');
+  const best = results.find(r => r.total != null);
+  if (!best) return msg('지금 운행 중인 버스가 없어요.');
+  const at = new Date(Date.now() + best.wait * 60000), arrive = new Date(at.getTime() + best.ride * 60000);
+  const walkTxt = best.stop.distance != null ? `${best.stop.name} (${best.stop.distance}m · 도보 약 ${best.walk}분)` : best.stop.name;
+  const rest = results.filter(r => r !== best);
+  $('main').innerHTML = `
+    <div class="best">
+      <div class="tag">⚡ 가장 빨리 도착하는 노선 · ${best.live ? '전광판 기준' : '위치 기반 추정'}</div>
+      <div class="top"><div class="no">${best.routeName}</div>
+        <div class="eta ${best.wait <= 6 ? 'soon' : ''}">${best.live ? best.wait + '분' : '약 ' + best.wait + '분'}<small>${best.away ? best.away + '정거장 전' : (best.live ? '' : '도착')}</small></div></div>
+      <dl>
+        <dt>승차</dt><dd>${walkTxt}</dd>
+        <dt>출발</dt><dd>${hhmm(at)}경${best.next != null ? ` · 다음 버스 ${best.next}정거장 전` : ''}</dd>
+        <dt>소요</dt><dd>${best.stops}정거장 · 약 ${best.ride}분 <small style="color:var(--sub)">(${best.rideLive ? '실시간 반영' : '어림값'})</small></dd>
+        <dt>도착</dt><dd><b>${hhmm(arrive)}경</b> (지금부터 약 ${best.total}분)</dd>
+      </dl>
+    </div>
+    ${rest.length ? `<button class="more" id="moreBtn">다른 노선 ${rest.length}개 보기 ▾</button><div id="others">${rest.map(row).join('')}</div>` : ''}`;
+  if (rest.length) $('moreBtn').onclick = () => {
+    const o = $('others'), open = o.style.display === 'block';
+    o.style.display = open ? 'none' : 'block';
+    $('moreBtn').textContent = open ? `다른 노선 ${rest.length}개 보기 ▾` : '접기 ▴';
+  };
+  $('upd').textContent = new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' 업데이트';
+}
+function row(r) {
+  const d = r.stop.distance != null ? `${r.stop.name} ${r.stop.distance}m` : r.stop.name;
+  if (r.total == null) return `<div class="item"><div class="no">${r.routeName}</div><div class="info">${d}<br>운행 중인 버스가 없어요</div><div class="eta" style="color:var(--sub)">정보없음</div></div>`;
+  const arrive = new Date(Date.now() + r.total * 60000);
+  return `<div class="item"><div class="no">${r.routeName}</div>
+    <div class="info">${d}<br>${r.stops}정거장 · 약 ${r.ride}분${r.rideLive ? '' : '(어림)'} → ${hhmm(arrive)}경 도착</div>
+    <div class="eta">${r.live ? r.wait + '분' : '약 ' + r.wait + '분'}<small>${r.away ? r.away + '정거장 전' : ''}${r.live ? '' : ' · 추정'}</small></div></div>`;
+}
+
+function restart() { clearInterval(timer); msg('가까운 정류장과 노선을 찾는 중이에요…'); refresh(); timer = setInterval(refresh, 30000); }
+
+// 정류장 검색 창 (직접 고르기)
+let target;
+const AUTO = '<li data-auto="1">📍 내 위치로 자동 선택</li>';
+function openPicker(which) {
+  target = which;
+  $('dlgTitle').textContent = which === 'from' ? '출발 정류장' : '도착 정류장 검색';
+  $('q').value = '';
+  $('res').innerHTML = which === 'from' ? AUTO : '';
+  $('dlg').showModal(); $('q').focus();
+}
+let qt;
+$('q').addEventListener('input', () => {
+  clearTimeout(qt);
+  qt = setTimeout(async () => {
+    const k = $('q').value.trim(); if (!k) return;
+    try {
+      const list = arr(await api('busstationservice/v2/getBusStationListv2', { keyword: k }), 'busStationList');
+      $('res').innerHTML = (target === 'from' ? AUTO : '') +
+        (list.slice(0, 30).map(s => `<li data-id="${s.stationId}" data-name="${s.stationName}">${s.stationName} <small>${s.regionName || ''} ${s.mobileNo ? '· ' + s.mobileNo : ''}</small></li>`).join('') || '<li>검색 결과가 없어요</li>');
+    } catch (e) { $('res').innerHTML = '<li>' + e.message + '</li>'; }
+  }, 300);
+});
+$('res').addEventListener('click', e => {
+  const li = e.target.closest('li'); if (!li) return;
+  if (li.dataset.auto) { from = null; here = null; save('from', null); }
+  else if (li.dataset.id) {
+    const v = { id: li.dataset.id, name: li.dataset.name };
+    if (target === 'from') { from = v; save('from', v); } else { to = v; save('to', v); }
+  } else return;
+  $('dlg').close(); origin = null; drawRoute(); restart();
+});
+$('fromBtn').onclick = () => openPicker('from');
+$('toBtn').onclick = () => openPicker('to');
+$('swap').onclick = () => {   // 출발↔도착 (내 위치 기준이면 지금 출발 정류장이 도착지가 돼요)
+  if (!origin) return;
+  const st = from ? origin : (results.find(r => r.total != null)?.stop || origin);   // 내 위치 기준이면 실제로 타는 정류장
+  const newTo = { id: st.id, name: st.name };
+  from = { id: to.id, name: to.name }; to = newTo;
+  save('from', from); save('to', to);
+  origin = null; drawRoute(); restart();
+};
+$('reload').onclick = () => { here = null; restart(); };
+
+drawRoute();
+restart();
+</script>
+</body>
+</html>

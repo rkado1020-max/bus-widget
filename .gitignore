@@ -1,0 +1,4 @@
+config.json
+server.log
+.vercel
+node_modules
